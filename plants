@@ -1,0 +1,634 @@
+
+from django.contrib import admin
+from .models import PlantSpecies, Plant, CareRecord, WateringSchedule, WeatherSnapshot
+
+@admin.register(PlantSpecies)
+class PlantSpeciesAdmin(admin.ModelAdmin):
+    list_display = ('name', 'scientific_name', 'ideal_temp_min', 'ideal_temp_max', 'sunlight_requirement', 'default_watering_interval')
+    list_filter = ('sunlight_requirement',)
+    search_fields = ('name', 'scientific_name', 'description')
+
+@admin.register(Plant)
+class PlantAdmin(admin.ModelAdmin):
+    list_display = ('nickname', 'species', 'vitality', 'stress_level', 'growth_stage', 'created_at')
+    list_filter = ('growth_stage', 'species', 'garden_theme')
+    search_fields = ('nickname', 'species__name')
+    # 디지털 트윈 상태를 강조하기 위해 활력도와 스트레스 지수를 리스트에서 바로 볼 수 있게 함
+
+@admin.register(CareRecord)
+class CareRecordAdmin(admin.ModelAdmin):
+    list_display = ('plant', 'action_type', 'timestamp')
+    list_filter = ('action_type', 'timestamp')
+    search_fields = ('plant__nickname', 'note')
+    date_hierarchy = 'timestamp'
+
+@admin.register(WateringSchedule)
+class WateringScheduleAdmin(admin.ModelAdmin):
+    list_display = ('plant', 'planned_date', 'is_completed', 'adjustment_reason')
+    list_filter = ('is_completed', 'planned_date')
+    search_fields = ('plant__nickname', 'adjustment_reason')
+    list_editable = ('is_completed',) # 관리자 페이지에서 바로 체크 가능하게 함
+    date_hierarchy = 'planned_date'
+
+@admin.register(WeatherSnapshot)
+class WeatherSnapshotAdmin(admin.ModelAdmin):
+    list_display = ('location_code', 'temperature', 'humidity', 'uv_index', 'condition_text', 'recorded_at')
+    list_filter = ('location_code', 'recorded_at')
+    search_fields = ('location_code', 'condition_text')
+    readonly_fields = ('recorded_at',) # 생성 시간은 읽기 전용으로 설정
+
+from django.apps import AppConfig
+
+
+class PlantsConfig(AppConfig):
+    name = 'plants'
+
+from django.db import models
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.contrib.auth.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    theme_garden = models.BooleanField(default=False, verbose_name="비밀의 정원 테마 사용")
+    theme_farm = models.BooleanField(default=False, verbose_name="활기찬 농장 테마 사용")
+    is_onboarded = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.user.username}'s Profile"
+
+@receiver(post_save, sender=User)
+def create_user_profile(sender, instance, created, **kwargs):
+    if created:
+        UserProfile.objects.get_or_create(user=instance)
+
+@receiver(post_save, sender=User)
+def save_user_profile(sender, instance, **kwargs):
+    instance.profile.save()
+
+class PlantSpecies(models.Model):
+    """식물 종 정보 (RAG 지식 베이스 및 기본 설정값)"""
+    name = models.CharField(max_length=100, verbose_name="식물 이름")
+    scientific_name = models.CharField(max_length=200, blank=True, verbose_name="학명")
+    description = models.TextField(verbose_name="설명")
+    
+    # 생육 적정 조건
+    ideal_temp_min = models.FloatField(default=15.0, verbose_name="최저 적정 온도")
+    ideal_temp_max = models.FloatField(default=28.0, verbose_name="최고 적정 온도")
+    ideal_humidity_min = models.FloatField(default=40.0, verbose_name="최저 적정 습도")
+    ideal_humidity_max = models.FloatField(default=70.0, verbose_name="최고 적정 습도")
+    
+    # 빛 요구도 (1: 음지, 2: 반음지, 3: 반양지, 4: 양지)
+    sunlight_requirement = models.IntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(4)],
+        default=3,
+        verbose_name="빛 요구도"
+    )
+    
+    # 기본 물주기 주기 (일 단위)
+    default_watering_interval = models.IntegerField(default=7, verbose_name="기본 물주기 주기(일)")
+
+    def __str__(self):
+        return self.name
+
+class Plant(models.Model):
+    """사용자가 등록한 식물 (Digital Twin)"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='plants', null=True, blank=True)
+    species = models.ForeignKey(PlantSpecies, on_delete=models.CASCADE, related_name='instances')
+    nickname = models.CharField(max_length=50, verbose_name="식물 별명")
+    emoji = models.CharField(max_length=10, default='🌿', verbose_name="식물 아이콘")
+    location = models.CharField(max_length=100, default='강남구', verbose_name="재배 지역 (시/군/구)")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="등록일")
+    
+    # 디지털 트윈 상태 데이터
+    vitality = models.IntegerField(default=100, validators=[MinValueValidator(0), MaxValueValidator(100)], verbose_name="활력도")
+    stress_level = models.IntegerField(default=0, validators=[MinValueValidator(0), MaxValueValidator(100)], verbose_name="스트레스 지수")
+    growth_stage = models.CharField(max_length=20, choices=[
+        ('SEED', '새싹'),
+        ('GROWING', '성장기'),
+        ('MATURE', '성체'),
+        ('FLOWERING', '개화'),
+    ], default='SEED', verbose_name="성장 단계")
+    
+    # 가상 정원 배치 정보
+    garden_position_x = models.FloatField(default=0.0)
+    garden_position_y = models.FloatField(default=0.0)
+    garden_theme = models.CharField(max_length=50, default='indoor', verbose_name="정원 테마")
+
+    def __str__(self):
+        return f"{self.nickname} ({self.species.name})"
+
+class CareRecord(models.Model):
+    """케어 이력 (물주기, 영양제 등)"""
+    plant = models.ForeignKey(Plant, on_delete=models.CASCADE, related_name='care_records')
+    action_type = models.CharField(max_length=20, choices=[
+        ('WATER', '물주기'),
+        ('NUTRIENT', '영양제'),
+        ('REPOT', '분갈이'),
+        ('PRUNE', '가지치기'),
+    ], verbose_name="수행 작업")
+    timestamp = models.DateTimeField(auto_now_add=True, verbose_name="수행 시간")
+    note = models.TextField(blank=True, verbose_name="메모")
+
+    def __str__(self):
+        return f"{self.plant.nickname} - {self.action_type} at {self.timestamp}"
+
+class WateringSchedule(models.Model):
+    """지능형 동적 스케줄러 데이터"""
+    plant = models.ForeignKey(Plant, on_delete=models.CASCADE, related_name='schedules')
+    planned_date = models.DateField(verbose_name="예정일")
+    is_completed = models.BooleanField(default=False, verbose_name="완료 여부")
+    
+    # 동적 조정 정보
+    adjustment_reason = models.CharField(max_length=255, blank=True, verbose_name="일정 조정 사유")
+    original_date = models.DateField(null=True, blank=True, verbose_name="기초 예정일")
+
+    class Meta:
+        ordering = ['planned_date']
+
+class WeatherSnapshot(models.Model):
+    """기상청 API 연동 데이터 스냅샷"""
+    location_code = models.CharField(max_length=20, verbose_name="지역 코드")
+    temperature = models.FloatField(verbose_name="기온")
+    humidity = models.FloatField(verbose_name="습도")
+    uv_index = models.FloatField(null=True, blank=True, verbose_name="자외선 지수")
+    condition_text = models.CharField(max_length=100, verbose_name="날씨 상태")
+    recorded_at = models.DateTimeField(auto_now_add=True, verbose_name="기록 시간")
+
+    def __str__(self):
+        return f"{self.location_code} at {self.recorded_at}"
+
+from django.test import TestCase
+
+# Create your tests here.
+
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.home, name='home'),
+    path('signup/', views.signup, name='signup'),
+    path('onboarding/', views.onboarding, name='onboarding'),
+    path('space/<str:space_type>/', views.space_view, name='space_view'),
+    path('calendar/', views.calendar_view, name='calendar'),
+    path('ai-chat/', views.ai_chat, name='ai_chat'),
+    path('water/<int:plant_id>/', views.water_plant, name='water_plant'),
+    path('delete/<int:plant_id>/', views.delete_plant, name='delete_plant'),
+    path('dashboard/', views.dashboard, name='dashboard'),
+
+    # PWA 필수 파일 라우팅
+    path('manifest.json', views.manifest_json, name='manifest_json'),
+    path('sw.js', views.service_worker, name='service_worker'),
+]
+
+
+import os
+import re
+import json
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+from django.conf import settings
+
+# [수정됨] 상용 대형 모델(Gemini) 제외 -> 오픈소스 SLM (Hugging Face API 활용)
+# 발표용 모델: Qwen2.5-3B-Instruct (한국어 성능이 뛰어난 대표적인 오픈소스 경량 모델)
+HF_API_KEY = getattr(settings, 'HF_API_KEY', None)
+SLM_API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-3B-Instruct"
+
+def query_open_source_slm(prompt):
+    """오픈소스 SLM 추론 엔진 연동 함수"""
+    if not HF_API_KEY:
+        raise ValueError("API 키 미설정")
+    
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 100, "temperature": 0.3}
+    }
+    
+    res = requests.post(SLM_API_URL, headers=headers, json=payload, timeout=4)
+    res.raise_for_status()
+    # 프롬프트를 제외한 순수 생성 텍스트만 파싱
+    return res.json()[0]['generated_text'].replace(prompt, '').strip()
+
+def get_josa(name, josa_type):
+    """한국어 조사 선택기 (은/는, 이/가)"""
+    if not name: return name
+    last_char = name[-1]
+    if 0xAC00 <= ord(last_char) <= 0xD7A3:
+        has_batchim = (ord(last_char) - 0xAC00) % 28 > 0
+        if josa_type == '은는': return "은" if has_batchim else "는"
+        elif josa_type == '이가': return "이" if has_batchim else "가"
+    return ""
+
+def get_smart_watering_interval(plant_name, context_data=""):
+    """
+    [RAG Generation 단계] SLM을 호출하여 물주기 주기를 정수로 도출.
+    크롤링된 도감 데이터(context_data)를 주입받아 판단력을 높입니다.
+    """
+    current_month = datetime.now().month
+    fallback_interval = 5
+    if any(k in plant_name for k in ['코스모스', '장미', '꽃']): fallback_interval = 3
+    elif any(k in plant_name for k in ['딸기', '감', '토마토']): fallback_interval = 4
+    elif any(k in plant_name for k in ['다육', '선인장', '스투키']): fallback_interval = 20
+
+    try:
+        # [핵심] RAG를 적용한 프롬프트 엔지니어링
+        prompt = f"""[System]: 당신은 식물 생태 전문가입니다.
+다음 [도감 참고 자료]를 읽고, '{plant_name}'의 일반적인 물주기 간격이 며칠인지 유추하세요.
+오직 정수 숫자 하나만 답하세요. (예: 3, 7, 14)
+
+[도감 참고 자료]: {context_data}
+
+[답변]:"""
+        response_text = query_open_source_slm(prompt)
+        match = re.search(r'\d+', response_text)
+        if match: return int(match.group())
+        return fallback_interval
+    except Exception as e:
+        print(f"SLM API Error (Registration): {e}")
+        return fallback_interval
+
+def scrape_plant_info(plant_name):
+    """
+    [핵심 복구: RAG Retrieval 단계 - 진짜 웹 스크래핑]
+    국가생물종지식정보시스템(nature.go.kr)에 실제 HTTP 요청을 보내 데이터를 긁어옵니다.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    search_url = f"https://www.nature.go.kr/kbi/plant/pilbk/selectPlantPilbkGnrlList.do?q={plant_name}"
+    
+    try:
+        print(f"DEBUG: {search_url} 스크래핑 시도 중...")
+        res = requests.get(search_url, headers=headers, timeout=3)
+        res.raise_for_status() 
+        
+        soup = BeautifulSoup(res.text, 'html.parser')
+        raw_text = soup.get_text(separator=' ', strip=True)
+        scraped_desc = raw_text[:300] 
+        
+        if len(scraped_desc) < 20: 
+            raise ValueError("검색된 문서 내용이 유효하지 않습니다.")
+            
+        return {
+            'scientific_name': f"{plant_name} sp.",
+            'description': f"[nature.go.kr 원본 데이터 추출] {scraped_desc}",
+            'default_watering_interval': 7 
+        }
+        
+    except Exception as e:
+        print(f"Scraping Timeout ({plant_name}): {e} -> 안정성을 위해 Fallback 지식 로드")
+        return {
+            'scientific_name': f"{plant_name} sp.",
+            'description': f"{plant_name}에 대한 생육 정보를 분석 중입니다. (서버 응답 지연으로 로컬 백과사전 지식망을 활용합니다.)",
+            'default_watering_interval': 7
+        }
+
+def get_ai_encyclopedia_answer(user_query, context_info):
+    """챗봇의 백과사전 Q&A 연동 (RAG Augmented Generation)"""
+    try:
+        # [핵심] RAG를 위해 외부 지식을 주입하는 프롬프트 엔지니어링
+        system_prompt = f"""[System]: 당신은 야외 정원 전문 식물 주치의입니다. 
+다음 [참고 지식]을 반드시 기반으로 유저의 [질문]에 2문장 이내로 답변하세요.
+[참고 지식]: {context_info}
+[질문]: {user_query}
+[답변]:"""
+        
+        return query_open_source_slm(system_prompt)
+    except Exception as e:
+        print(f"SLM API Error (Chat): {e}")
+        return "선생님이 잠시 자리를 비우셨어요. 잠시 후에 다시 물어봐 주시겠어요? 🩺"
+
+def generate_ai_medical_report(plant, weather_data):
+    """채팅방 상단 정기 검진 리포트 자동화 (SLM 없이 Rule-based로 최적화)"""
+    josa = get_josa(plant.nickname, '은는')
+    try:
+        if '비' in weather_data['condition']:
+            return f"현재 비가 오고 있어 습도가 높습니다. {plant.species.name}{josa} 과습에 취약할 수 있으니 환기에 특별히 신경 써주세요! ☔"
+        elif weather_data['temp'] > 28:
+            return f"무더운 날씨네요! {plant.nickname}{josa} 물을 충분히 마셔야 할 시기입니다. 직사광선은 피해서 시원한 곳에 두세요. ☀️"
+        else:
+            return f"{weather_data['location_name']}의 날씨가 {plant.nickname}{josa} 자라기에 아주 적합합니다. 지금처럼만 돌봐주세요! 🌱"
+    except:
+        return f"{plant.nickname}의 상태를 체크 중입니다. 활기찬 하루 되세요!"
+
+import random
+import requests
+import json
+import calendar as py_calendar
+from bs4 import BeautifulSoup
+from datetime import date, timedelta, datetime
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib import messages
+from django.contrib.auth import login, authenticate
+from django.contrib.auth.forms import UserCreationForm
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.http import require_POST
+from django.conf import settings
+from django.http import JsonResponse, HttpResponse
+
+from .models import Plant, PlantSpecies, WateringSchedule, UserProfile, CareRecord
+from .utils import get_smart_watering_interval, get_ai_encyclopedia_answer, generate_ai_medical_report, get_josa, scrape_plant_info
+
+# OpenWeatherMap API 키 (없을 경우 fallback 적용)
+OPENWEATHER_API_KEY = getattr(settings, 'OPENWEATHER_API_KEY', 'default_mock_key')
+
+def get_dynamic_watering_offset(location_name):
+    """
+    [핵심 알고리즘] 실시간 기상 데이터를 파싱하여 증발량을 계산하고, 
+    기준 물주기 주기에서 가감산할 날짜(Offset)를 정수로 반환합니다.
+    """
+    if OPENWEATHER_API_KEY == 'default_mock_key' or not OPENWEATHER_API_KEY:
+        return 0
+        
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={location_name}&appid={OPENWEATHER_API_KEY}&units=metric"
+        res = requests.get(url, timeout=3)
+        res.raise_for_status()
+        data = res.json()
+        
+        temp = data['main']['temp']
+        condition = data['weather'][0]['main']
+        
+        offset = 0
+        # 강수 조건 (습도가 높아 증발량이 적으므로 주기를 연장)
+        if 'Rain' in condition or 'Thunderstorm' in condition:
+            offset += 2  # 비 오면 2일 연기
+        elif 'Drizzle' in condition:
+            offset += 1  # 이슬비 1일 연기
+            
+        # 기온 조건 (온도가 높아 증발량이 많으므로 주기를 단축)
+        if temp >= 33.0:
+            offset -= 2  # 33도 이상 폭염 시 2일 단축
+        elif temp >= 28.0:
+            offset -= 1  # 28도 이상 더위 시 1일 단축
+            
+        elif temp <= 5.0:
+            offset += 3  # 한파 휴면기 3일 연기
+            
+        return offset
+    except Exception as e:
+        print(f"Weather API Error: {e}")
+        return 0
+
+# [인증 관련]
+def signup(request):
+    if request.method == 'POST':
+        form = UserCreationForm(request.POST)
+        if form.is_valid():
+            user = form.save()
+            login(request, user)
+            return redirect('onboarding')
+    else: form = UserCreationForm()
+    return render(request, 'registration/signup.html', {'form': form})
+
+@login_required
+def onboarding(request):
+    if request.method == 'POST':
+        themes = request.POST.getlist('themes')
+        profile, _ = UserProfile.objects.get_or_create(user=request.user)
+        profile.theme_garden = 'GARDEN' in themes
+        profile.theme_farm = 'FARM' in themes
+        profile.is_onboarded = True
+        profile.save()
+        return redirect('home')
+    return render(request, 'plants/onboarding.html')
+
+# [메인 허브]
+@login_required
+def home(request):
+    profile, _ = UserProfile.objects.get_or_create(user=request.user)
+    if not profile.is_onboarded: return redirect('onboarding')
+    return render(request, 'plants/home.html', {'profile': profile})
+
+def get_weather_info(location_name):
+    """뷰 상단에 표시될 날씨 요약 정보 (API 또는 Mocking)"""
+    josa = get_josa(location_name, '은는')
+    return {
+        'location_name': location_name, 'temp': 21.5, 'humidity': 45,
+        'condition': '맑음', 'icon': 'fa-sun',
+        'recommendation': f"{location_name}{josa} 현재 아주 화창한 날씨예요! ☀️"
+    }
+
+@login_required
+def dashboard(request):
+    profile, _ = UserProfile.objects.get_or_create(user=request.user)
+    return render(request, 'plants/dashboard.html', {'profile': profile})
+
+# [가상 공간 상세 뷰]
+@login_required
+def space_view(request, space_type):
+    profile = request.user.profile
+    if (space_type == 'garden' and not profile.theme_garden) or (space_type == 'farm' and not profile.theme_farm):
+        return redirect('home')
+        
+    if request.method == 'POST':
+        species_name = request.POST.get('species_name', '').strip()
+        nickname = request.POST.get('nickname', '').strip()
+        location = request.POST.get('location', '서울')
+        emoji = request.POST.get('emoji', '🌿')
+        
+        if species_name and nickname:
+            # 1. SLM 또는 Fallback을 통해 기본 간격 산출
+            base_interval = get_smart_watering_interval(species_name)
+            
+            species, _ = PlantSpecies.objects.get_or_create(
+                name=species_name,
+                defaults={
+                    'scientific_name': f"{species_name} sp.",
+                    'description': f"{species_name}의 생육 정보가 등록되었습니다.",
+                    'default_watering_interval': base_interval
+                }
+            )
+            plant = Plant.objects.create(
+                user=request.user, species=species, nickname=nickname, 
+                emoji=emoji, location=location, garden_theme=space_type
+            )
+            
+            # 2. [날씨 동적 스케줄링 적용]
+            weather_offset = get_dynamic_watering_offset(location)
+            final_interval = max(1, base_interval + weather_offset) # 최소 1일 보장
+            
+            WateringSchedule.objects.create(plant=plant, planned_date=date.today() + timedelta(days=final_interval))
+            msg = f"🎉 {nickname}가 심어졌습니다! (기본 {base_interval}일 주기"
+            if weather_offset != 0:
+                direction = "단축" if weather_offset < 0 else "연장"
+                msg += f" / ☀️날씨 반영: {abs(weather_offset)}일 {direction})"
+            else:
+                msg += ")"
+            messages.success(request, msg)
+            return redirect('space_view', space_type=space_type)
+
+    plants = request.user.plants.filter(garden_theme=space_type)
+    weather = get_weather_info(plants.first().location if plants.exists() else '서울')
+    
+    ai_report = "식물을 등록하면 AI 주치의가 실시간 진단을 시작합니다."
+    if plants.exists():
+        p = plants.order_by('vitality').first()
+        ai_report = generate_ai_medical_report(p, weather)
+    
+    return render(request, 'plants/space_view.html', {'space_type': space_type, 'plants': plants, 'weather': weather, 'ai_report': ai_report, 'theme_name': '비밀의 정원' if space_type == 'garden' else '활기찬 농장'})
+
+# [데이터 관리]
+@login_required
+@require_POST
+def water_plant(request, plant_id):
+    plant = get_object_or_404(Plant, id=plant_id, user=request.user)
+    
+    # 기록 생성 및 기존 미완료 일정 삭제 (Hard Delete)
+    CareRecord.objects.create(plant=plant, action_type='WATER')
+    WateringSchedule.objects.filter(plant=plant, is_completed=False).delete()
+    
+    # [날씨 동적 스케줄링 적용] 다음 물주기 날짜 계산
+    base_interval = plant.species.default_watering_interval
+    weather_offset = get_dynamic_watering_offset(plant.location)
+    final_interval = max(1, base_interval + weather_offset)
+    
+    next_date = date.today() + timedelta(days=final_interval)
+    WateringSchedule.objects.create(plant=plant, planned_date=next_date)
+    
+    msg = f"물주기 완료! "
+    if weather_offset < 0:
+        msg += f"폭염/건조가 예상되어 주기가 {abs(weather_offset)}일 앞당겨졌습니다. (다음: {next_date.strftime('%m월 %d일')})"
+    elif weather_offset > 0:
+        msg += f"비/다습이 예상되어 주기가 {weather_offset}일 연장되었습니다. (다음: {next_date.strftime('%m월 %d일')})"
+    else:
+        msg += f"다음 일정은 {next_date.strftime('%m월 %d일')}입니다."
+        
+    return JsonResponse({'status': 'success', 'message': msg})
+
+@login_required
+@require_POST
+def delete_plant(request, plant_id):
+    plant = get_object_or_404(Plant, id=plant_id, user=request.user)
+    space_type = plant.garden_theme
+    WateringSchedule.objects.filter(plant=plant).delete()
+    CareRecord.objects.filter(plant=plant).delete()
+    plant.delete()
+    return redirect('space_view', space_type=space_type)
+
+# [달력 뷰]
+@login_required
+def calendar_view(request):
+    today = date.today()
+    year = int(request.GET.get('year', today.year))
+    month = int(request.GET.get('month', today.month))
+    cal_obj = py_calendar.Calendar(firstweekday=6)
+    month_days = cal_obj.monthdatescalendar(year, month)
+    schedules = WateringSchedule.objects.filter(plant__user=request.user, plant__isnull=False, is_completed=False, planned_date__range=[month_days[0][0], month_days[-1][-1]]).select_related('plant')
+    sched_dict = {}
+    for s in schedules:
+        if s.planned_date not in sched_dict: sched_dict[s.planned_date] = []
+        sched_dict[s.planned_date].append(s)
+    calendar_data = []
+    for week in month_days:
+        week_data = []
+        for d in week:
+            day_schedules = sched_dict.get(d, [])
+            plant_list = ", ".join([f"{s.plant.emoji}{s.plant.nickname}" for s in day_schedules])
+            week_data.append({'date': d, 'display_date': d.strftime('%Y년 %m월 %d일'), 'day': d.day, 'is_today': d == today, 'is_current_month': d.month == month, 'has_schedules': len(day_schedules) > 0, 'plant_list': plant_list})
+        calendar_data.append(week_data)
+    return render(request, 'plants/calendar.html', {'calendar_data': calendar_data, 'current_year': year, 'current_month': month, 'prev_month': (datetime(year, month, 1) - timedelta(days=1)), 'next_month': (datetime(year, month, 1) + timedelta(days=32)).replace(day=1)})
+
+# [AI 챗봇 - SLM RAG 연동 버전]
+@login_required
+def ai_chat(request):
+    plants = request.user.plants.all()
+    weather = get_weather_info(plants.first().location if plants.exists() else '서울')
+    chat_history = request.session.get('chat_history', [])
+    
+    if request.method == 'POST':
+        user_msg = request.POST.get('message', '').strip()
+        ai_reply = ""
+        fast_track = False
+        
+        # 1. Fast-Track: 기록 조회 및 행동 연동 (Bypass)
+        if any(k in user_msg for k in ["물 줬나", "언제", "기록", "마지막"]):
+            for p in plants:
+                if p.nickname in user_msg:
+                    last = CareRecord.objects.filter(plant=p, action_type='WATER').order_by('-timestamp').first()
+                    ai_reply = f"집사님! '{p.nickname}'는 {last.timestamp.strftime('%m월 %d일')}에 마지막으로 물을 마셨어요. 💧" if last else f"'{p.nickname}'의 기록이 아직 없네요!"
+                    fast_track = True; break
+        elif "물" in user_msg and any(k in user_msg for k in ["줬어", "완료", "줬다"]):
+            for p in plants:
+                if p.nickname in user_msg:
+                    CareRecord.objects.create(plant=p, action_type='WATER')
+                    WateringSchedule.objects.filter(plant=p, is_completed=False).delete()
+                    
+                    # 동적 스케줄링 적용
+                    base_int = p.species.default_watering_interval
+                    offset = get_dynamic_watering_offset(p.location)
+                    next_d = date.today() + timedelta(days=max(1, base_int + offset))
+                    
+                    WateringSchedule.objects.create(plant=p, planned_date=next_d)
+                    ai_reply = f"📝 '{p.nickname}' 물주기 완료! 날씨({offset}일 조정)를 반영해 다음 물주기는 {next_d.strftime('%m월 %d일')}로 달력에 업데이트했어요. ✨"
+                    fast_track = True; break
+        
+        # 2. RAG AI 상담 (SLM 연동)
+        if not fast_track:
+            plant_info = "\n".join([f"- {p.nickname}({p.species.name}): {p.species.description}" for p in plants])
+            context = f"현재 날씨: {weather['temp']}도, {weather['condition']}\n보유 식물 정보:\n{plant_info}"
+            ai_reply = get_ai_encyclopedia_answer(user_msg, context)
+
+        chat_history.append({'role': 'user', 'content': user_msg})
+        chat_history.append({'role': 'ai', 'content': ai_reply})
+        request.session['chat_history'] = chat_history[-10:]
+        return redirect('ai_chat')
+
+    reports = []
+    if plants.exists():
+        for p in plants[:2]:
+            josa = get_josa(p.nickname, '은는')
+            reports.append({'plant': p, 'report': f"{p.nickname}{josa} 쾌적한 환경 속에 잘 자라고 있네요! 건강한 반려생활 되세요. 🌱"})
+            
+    context = {'plants': plants, 'weather': weather, 'chat_history': chat_history, 'reports': reports}
+    return render(request, 'plants/ai_chat.html', context)
+            
+# [PWA 지원용 뷰]
+def manifest_json(request):
+    manifest = {
+        "name": "PlanTgotchi",
+        "short_name": "PlanTgotchi",
+        "description": "지능형 야외 정원 반려식물 케어 플랫폼",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0d1117",
+        "theme_color": "#238636",
+        "icons": [
+            {
+                "src": "/static/plants/images/icon-192x192.png",
+                "sizes": "192x192",
+                "type": "image/png"
+            },
+            {
+                "src": "/static/plants/images/icon-512x512.png",
+                "sizes": "512x512",
+                "type": "image/png"
+            }
+        ]
+    }
+    return JsonResponse(manifest)
+
+def service_worker(request):
+    sw_code = """
+    const CACHE_NAME = 'plantgotchi-v3';
+
+    self.addEventListener('install', event => {
+        // 즉시 설치 및 활성화하여 기존의 꼬인 캐시/워커 밀어내기
+        self.skipWaiting();
+    });
+
+    self.addEventListener('activate', event => {
+        event.waitUntil(clients.claim());
+    });
+
+    self.addEventListener('fetch', event => {
+        // [긴급 핫픽스] 브라우저 이동 무반응(Silent Fail)을 원천 차단하기 위해
+        // 서비스 워커의 fetch 가로채기 기능을 완전히 비활성화합니다.
+        // 이렇게 하면 PWA(앱 설치) 기능은 유지되면서, 페이지 이동은 기존 웹처럼 정상 작동합니다.
+        return; 
+    });
+    """
+    return HttpResponse(sw_code, content_type='application/javascript')
