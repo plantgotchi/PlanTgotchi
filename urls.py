@@ -1,19 +1,24 @@
-from django.urls import path
-from . import views
+"""
+URL configuration for config project.
+
+The `urlpatterns` list routes URLs to views. For more information please see:
+    https://docs.djangoproject.com/en/6.0/topics/http/urls/
+Examples:
+Function views
+    1. Add an import:  from my_app import views
+    2. Add a URL to urlpatterns:  path('', views.home, name='home')
+Class-based views
+    1. Add an import:  from other_app.views import Home
+    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
+Including another URLconf
+    1. Import the include() function: from django.urls import include, path
+    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
+"""
+from django.contrib import admin
+from django.urls import path, include
 
 urlpatterns = [
-    path('', views.home, name='home'),
-    path('signup/', views.signup, name='signup'),
-    path('onboarding/', views.onboarding, name='onboarding'),
-    path('space/<str:space_type>/', views.space_view, name='space_view'),
-    path('calendar/', views.calendar_view, name='calendar'),
-    path('ai-chat/', views.ai_chat, name='ai_chat'),
-    path('water/<int:plant_id>/', views.water_plant, name='water_plant'),
-    path('delete/<int:plant_id>/', views.delete_plant, name='delete_plant'),
-    path('dashboard/', views.dashboard, name='dashboard'),
-
-    # PWA 필수 파일 라우팅
-    path('manifest.json', views.manifest_json, name='manifest_json'),
-    path('sw.js', views.service_worker, name='service_worker'),
+    path('admin/', admin.site.urls),
+    path('accounts/', include('django.contrib.auth.urls')),
+    path('', include('plants.urls')),
 ]
-
